@@ -52,20 +52,55 @@ static int FEED_SPS = 5000;
 static int REV_SPS  = 4000;
 static int AUTO_SPS = 6000;
 
-static int MOTION_TIMEOUT_MS = 800;
-// cooldown/startup: zolang na start géén error, zodat je filament kan doorvoeren tot de sensor iets ziet
-static int MOTION_STARTUP_MAX_MS = 8000;
-static bool MOTION_FAULT_ENABLED = false; // default OFF zoals je wilde
+static bool MOTION_FAULT_ENABLED = false;
+static int  MOTION_TIMEOUT_MS    = 800;
+static int  MOTION_STARTUP_MS    = 5000;
+
+static int  RUNOUT_COOLDOWN_MS   = 12000;
+
+static int  LOW_DELAY_MS         = 400;
+static int  SWAP_COOLDOWN_MS     = 500;
+static bool REQUIRE_Y_EMPTY_SWAP = true;
+
+static int  RAMP_STEP_SPS        = 200;
+static int  RAMP_TICK_MS         = 5;
 
 static inline int clamp_i(int v, int lo, int hi){ if(v<lo) return lo; if(v>hi) return hi; return v; }
 
-// ===================== Runout (PC817) =====================
-static inline void runout_init(void){
-    gpio_init(PIN_RUNOUT_OUT);
-    gpio_set_dir(PIN_RUNOUT_OUT, GPIO_OUT);
-    gpio_put(PIN_RUNOUT_OUT, 0);
+// ===================== Debounced inputs =====================
+typedef struct {
+    uint pin;
+    bool stable;
+    bool last_raw;
+    absolute_time_t last_edge;
+} din_t;
+
+static inline void din_init(din_t *d, uint pin) {
+    d->pin = pin;
+    gpio_init(pin);
+    gpio_set_dir(pin, GPIO_IN);
+    gpio_pull_up(pin);
+    bool raw = gpio_get(pin);
+    d->stable = raw;
+    d->last_raw = raw;
+    d->last_edge = get_absolute_time();
 }
-static inline void runout_set(bool on){ gpio_put(PIN_RUNOUT_OUT, on ? 1 : 0); }
+
+static inline void din_update(din_t *d) {
+    absolute_time_t now = get_absolute_time();
+    bool raw = gpio_get(d->pin);
+    if (raw != d->last_raw) {
+        d->last_raw = raw;
+        d->last_edge = now;
+    }
+    if (raw != d->stable) {
+        if (absolute_time_diff_us(d->last_edge, now) >= 10 * 1000) {
+            d->stable = raw;
+        }
+    }
+}
+
+static inline bool on_al(const din_t *d){ return d->stable == 0; }
 
 // ===================== Motion =====================
 static volatile uint32_t g_now_ms = 0;
@@ -103,7 +138,17 @@ static inline void motion_reset(void) {
     g_motion_prev_raw = gpio_get(PIN_SFS_MOT);
 }
 
-// ===================== PWM Stepper =====================
+// ===================== Runout =====================
+static uint32_t g_runout_block_until = 0;
+
+static inline void runout_init(void){
+    gpio_init(PIN_RUNOUT_OUT);
+    gpio_set_dir(PIN_RUNOUT_OUT, GPIO_OUT);
+    gpio_put(PIN_RUNOUT_OUT, 0);
+}
+static inline void runout_set(bool on){ gpio_put(PIN_RUNOUT_OUT, on ? 1 : 0); }
+
+// ===================== Motor =====================
 typedef struct {
     uint en, dir, step;
     bool dir_invert;
@@ -112,9 +157,9 @@ typedef struct {
 } motor_t;
 
 static void motor_init(motor_t *m, uint en, uint dir, uint step, bool dir_invert) {
-    m->en=en; m->dir=dir; m->step=step; m->dir_invert=dir_invert;
+    m->en = en; m->dir = dir; m->step = step; m->dir_invert = dir_invert;
 
-    gpio_init(m->en);  gpio_set_dir(m->en,  GPIO_OUT);
+    gpio_init(m->en); gpio_set_dir(m->en, GPIO_OUT);
     gpio_init(m->dir); gpio_set_dir(m->dir, GPIO_OUT);
 
     if (EN_ACTIVE_LOW) gpio_put(m->en, 1); else gpio_put(m->en, 0);
@@ -140,7 +185,10 @@ static inline void motor_set_dir(motor_t *m, bool forward) {
 }
 
 static void motor_set_rate_sps(motor_t *m, int sps) {
-    if (sps <= 0) { pwm_set_enabled(m->slice, false); return; }
+    if (sps <= 0) {
+        pwm_set_enabled(m->slice, false);
+        return;
+    }
 
     uint32_t sys = clock_get_hz(clk_sys);
     float target = (float)sps;
@@ -159,12 +207,12 @@ static void motor_set_rate_sps(motor_t *m, int sps) {
     pwm_set_enabled(m->slice, true);
 }
 
-static inline void motor_stop(motor_t *m){
+static inline void motor_stop(motor_t *m) {
     pwm_set_enabled(m->slice, false);
     motor_enable(m, false);
 }
 
-// ===================== OLED (u8g2) =====================
+// ===================== OLED =====================
 static u8g2_t g_u8g2;
 static uint8_t g_i2c_buf[128];
 static uint8_t g_i2c_len = 0;
@@ -194,6 +242,7 @@ static uint8_t u8x8_byte_pico_i2c(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, vo
         default: return 0;
     }
 }
+
 static uint8_t u8x8_gpio_delay_pico(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void *arg_ptr) {
     (void)u8x8; (void)arg_ptr;
     switch (msg) {
@@ -203,6 +252,7 @@ static uint8_t u8x8_gpio_delay_pico(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, 
         default: return 1;
     }
 }
+
 static void oled_init(void) {
     i2c_init(OLED_I2C_INST, I2C_BAUDRATE);
     gpio_set_function(PIN_I2C_SDA, GPIO_FUNC_I2C);
@@ -218,7 +268,7 @@ static void oled_init(void) {
     u8g2_SendBuffer(&g_u8g2);
 }
 
-// ===================== Encoder + Buttons (JOUW WERKENDE STUK) =====================
+// ===================== Encoder + Buttons =====================
 #define ENC_STEP_MS   4
 #define ENC_DIR_HYST  1
 #define CONFIRM_LONGPRESS_MS 450
@@ -308,27 +358,14 @@ static int main_idx=0;
 static int settings_idx=0;
 static int manual_idx=0;
 
-static int active_lane=1;
-
-// manual state
-typedef enum { MAN_OFF=0, MAN_FEED=1, MAN_REV=2 } man_action_t;
+typedef enum { MAN_FEED=0, MAN_REV=1 } man_action_t;
 static int manual_lane = 1;
 static man_action_t manual_action = MAN_FEED;
 static bool manual_running = false;
 static int manual_sps = 0;
-static uint32_t manual_started_ms = 0;
-
-// motion timing
-static uint32_t motion_started_ms=0;
-static bool motion_was_moving=false;
 
 static const char* main_label(int i){
-    switch(i){
-        case 0: return "Settings";
-        case 1: return "Manual";
-        case 2: return "Exit";
-        default: return "?";
-    }
+    switch(i){ case 0:return "Settings"; case 1:return "Manual"; case 2:return "Exit"; default:return "?"; }
 }
 static const char* settings_label(int i){
     switch(i){
@@ -338,20 +375,14 @@ static const char* settings_label(int i){
         case 3: return "Motion ms";
         case 4: return "Cooldown ms";
         case 5: return "Motion fault";
+        case 6: return "Runout cool";
         default: return "?";
     }
 }
 static const char* manual_label(int i){
-    switch(i){
-        case 0: return "Lane";
-        case 1: return "Action";
-        case 2: return "Run/Stop";
-        default: return "?";
-    }
+    switch(i){ case 0:return "Lane"; case 1:return "Action"; case 2:return "Run/Stop"; default:return "?"; }
 }
-static const char* action_str(man_action_t a){
-    return (a==MAN_FEED) ? "FEED" : (a==MAN_REV) ? "REV" : "OFF";
-}
+static const char* action_str(man_action_t a){ return (a==MAN_FEED) ? "FEED" : "REV"; }
 
 static void draw_error(void){
     u8g2_ClearBuffer(&g_u8g2);
@@ -361,31 +392,6 @@ static void draw_error(void){
     u8g2_DrawStr(&g_u8g2, 0, 30, error_msg);
     u8g2_DrawStr(&g_u8g2, 0, 50, "RUNOUT -> pause");
     u8g2_DrawStr(&g_u8g2, 0, 62, "BACK clears");
-    u8g2_SendBuffer(&g_u8g2);
-}
-
-static void draw_home(bool motion_ok){
-    u8g2_ClearBuffer(&g_u8g2);
-    u8g2_SetFont(&g_u8g2, u8g2_font_6x10_tf);
-
-    u8g2_DrawStr(&g_u8g2, 0, 10, "NightOwl");
-    u8g2_DrawHLine(&g_u8g2, 0, 12, 128);
-
-    char s[64];
-    snprintf(s, sizeof(s), "Lane: L%d", active_lane);
-    u8g2_DrawStr(&g_u8g2, 0, 24, s);
-
-    snprintf(s, sizeof(s), "Feed:%d Rev:%d Auto:%d", FEED_SPS, REV_SPS, AUTO_SPS);
-    u8g2_DrawStr(&g_u8g2, 0, 36, s);
-
-    bool raw = gpio_get(PIN_SFS_MOT);
-    snprintf(s, sizeof(s), "Mot:%s RAW:%d I:%lu P:%lu",
-             motion_ok?"OK":"NO", raw?1:0,
-             (unsigned long)g_motion_edges_irq,
-             (unsigned long)g_motion_edges_poll);
-    u8g2_DrawStr(&g_u8g2, 0, 60, s);
-
-    u8g2_DrawStr(&g_u8g2, 0, 50, "CONF=Menu");
     u8g2_SendBuffer(&g_u8g2);
 }
 
@@ -447,7 +453,76 @@ static void draw_manual(void){
     u8g2_SendBuffer(&g_u8g2);
 }
 
-// ===================== MAIN =====================
+// ===================== NightOwl core =====================
+typedef enum { TASK_IDLE=0, TASK_AUTOLOAD=1, TASK_FEED=2, TASK_MANUAL=3 } task_t;
+
+typedef struct {
+    din_t in_sw;
+    din_t out_sw;
+    motor_t m;
+    task_t task;
+    uint32_t autoload_deadline_ms;
+} lane_t;
+
+static inline bool lane_in_present(lane_t *L){ return on_al(&L->in_sw); }
+static inline bool lane_out_present(lane_t *L){ return on_al(&L->out_sw); }
+
+static void lane_setup(lane_t *L, uint pin_in, uint pin_out, motor_t m){
+    din_init(&L->in_sw, pin_in);
+    din_init(&L->out_sw, pin_out);
+    L->m = m;
+    L->task = TASK_IDLE;
+    L->autoload_deadline_ms = 0;
+}
+
+static void lane_stop(lane_t *L){
+    L->task = TASK_IDLE;
+    motor_stop(&L->m);
+}
+
+static void lane_start(lane_t *L, task_t t, int sps, bool forward, uint32_t now_ms, int autoload_timeout_ms){
+    L->task = t;
+    if(t == TASK_AUTOLOAD) L->autoload_deadline_ms = now_ms + (uint32_t)autoload_timeout_ms;
+
+    motor_enable(&L->m, true);
+    motor_set_dir(&L->m, forward);
+    motor_set_rate_sps(&L->m, sps);
+}
+
+static void lane_tick(lane_t *L, uint32_t now_ms){
+    if(L->task == TASK_AUTOLOAD){
+        if(lane_out_present(L) || (int32_t)(now_ms - L->autoload_deadline_ms) >= 0){
+            lane_stop(L);
+        }
+    }
+}
+
+static inline lane_t* lane_ptr(int lane, lane_t *L1, lane_t *L2){ return (lane==1)?L1:L2; }
+static inline int other_lane(int lane){ return (lane==1)?2:1; }
+
+static bool feeding_latched=false;
+static uint32_t low_since_ms=0;
+static bool swap_armed=false;
+static uint32_t swap_block_until_ms=0;
+
+static bool y_state=false;
+static uint32_t y_change_ms=0;
+
+static int ramp_target=0;
+static int ramp_current=0;
+static uint32_t ramp_last_ms=0;
+
+static int active_lane=1;
+
+static void stop_all(lane_t *L1, lane_t *L2){
+    lane_stop(L1);
+    lane_stop(L2);
+    feeding_latched=false;
+    swap_armed=false;
+    ramp_target=0;
+    ramp_current=0;
+}
+
 int main(void){
     stdio_init_all();
     sleep_ms(200);
@@ -457,19 +532,54 @@ int main(void){
     runout_init();
     motion_init();
 
-    motor_t M1, M2;
-    motor_init(&M1, PIN_M1_EN, PIN_M1_DIR, PIN_M1_STEP, M1_DIR_INVERT);
-    motor_init(&M2, PIN_M2_EN, PIN_M2_DIR, PIN_M2_STEP, M2_DIR_INVERT);
+    din_t y_split, buf_low, buf_high;
+    din_init(&y_split, PIN_Y_SPLIT);
+    din_init(&buf_low, PIN_BUF_LOW);
+    din_init(&buf_high, PIN_BUF_HIGH);
+
+    motor_t m1, m2;
+    motor_init(&m1, PIN_M1_EN, PIN_M1_DIR, PIN_M1_STEP, M1_DIR_INVERT);
+    motor_init(&m2, PIN_M2_EN, PIN_M2_DIR, PIN_M2_STEP, M2_DIR_INVERT);
+
+    lane_t L1, L2;
+    lane_setup(&L1, PIN_L1_IN, PIN_L1_OUT, m1);
+    lane_setup(&L2, PIN_L2_IN, PIN_L2_OUT, m2);
 
     absolute_time_t last_ui=get_absolute_time();
     absolute_time_t last_poll=get_absolute_time();
+
+    uint32_t motion_started_ms=0;
+    bool motion_was_moving=false;
 
     while(true){
         absolute_time_t now=get_absolute_time();
         uint32_t now_ms=to_ms_since_boot(now);
         g_now_ms = now_ms;
 
-        // motion polling edges (1ms)
+        din_update(&y_split);
+        din_update(&buf_low);
+        din_update(&buf_high);
+        din_update(&L1.in_sw); din_update(&L1.out_sw);
+        din_update(&L2.in_sw); din_update(&L2.out_sw);
+
+        // Y debounce/hysteresis
+        bool y_raw = on_al(&y_split);
+        if(y_raw != y_state){
+            if((now_ms - y_change_ms) > 30){
+                y_state = y_raw;
+                y_change_ms = now_ms;
+            }
+        }
+        bool y_present = y_state;
+        bool y_empty   = !y_state;
+
+        bool buffer_low  = on_al(&buf_low);
+        bool buffer_high = on_al(&buf_high);
+
+        bool l1_in = lane_in_present(&L1);
+        bool l2_in = lane_in_present(&L2);
+
+        // motion polling edges for debug
         if(absolute_time_diff_us(last_poll, now) > 1000){
             last_poll = now;
             bool raw = gpio_get(PIN_SFS_MOT);
@@ -479,40 +589,40 @@ int main(void){
             }
         }
 
-        // input
         evt_t ev = input_poll(now_ms);
 
-        motor_t *A = (manual_lane==1) ? &M1 : &M2;
-
-        // error clear
         if(error_active){
             if(ev==EVT_BACK_DOWN){
                 error_active=false;
                 error_msg="";
                 runout_set(false);
                 motion_reset();
-                manual_running=false;
-                motor_stop(&M1); motor_stop(&M2);
+                stop_all(&L1,&L2);
                 screen=SCR_HOME;
             }
         } else {
-            // manual running: encoder changes speed, BACK stops
+
             if(screen==SCR_MANUAL && manual_running){
+                lane_t *LM = lane_ptr(manual_lane, &L1, &L2);
+
                 if(ev==EVT_CW){
                     manual_sps = clamp_i(manual_sps+200, 200, 30000);
-                    motor_set_rate_sps(A, manual_sps);
+                    motor_set_rate_sps(&LM->m, manual_sps);
                 } else if(ev==EVT_CCW){
                     manual_sps = clamp_i(manual_sps-200, 200, 30000);
-                    motor_set_rate_sps(A, manual_sps);
+                    motor_set_rate_sps(&LM->m, manual_sps);
                 } else if(ev==EVT_BACK_DOWN){
                     manual_running=false;
-                    motor_stop(A);
+                    lane_stop(LM);
                 }
             } else {
-                // UI navigation
+
                 if(screen==SCR_HOME){
                     if(ev==EVT_CONFIRM) screen=SCR_MENU;
-                    // (optioneel) lane switch op encoder op home: maar jij vond dat gevoelig, dus laten we het weg.
+
+                    // live feedrate on home
+                    if(ev==EVT_CW)  FEED_SPS = clamp_i(FEED_SPS+200, 200, 30000);
+                    if(ev==EVT_CCW) FEED_SPS = clamp_i(FEED_SPS-200, 200, 30000);
                 }
                 else if(screen==SCR_MENU){
                     if(ev==EVT_CW){ main_idx++; if(main_idx>2) main_idx=2; }
@@ -525,7 +635,7 @@ int main(void){
                     }
                 }
                 else if(screen==SCR_SETTINGS){
-                    if(ev==EVT_CW){ settings_idx++; if(settings_idx>5) settings_idx=5; }
+                    if(ev==EVT_CW){ settings_idx++; if(settings_idx>6) settings_idx=6; }
                     if(ev==EVT_CCW){ settings_idx--; if(settings_idx<0) settings_idx=0; }
                     if(ev==EVT_BACK_DOWN) screen=SCR_MENU;
                     if(ev==EVT_CONFIRM) screen=SCR_SETTINGS_EDIT;
@@ -536,16 +646,18 @@ int main(void){
                         if(settings_idx==1) REV_SPS  = clamp_i(REV_SPS+200, 200, 30000);
                         if(settings_idx==2) AUTO_SPS = clamp_i(AUTO_SPS+200, 200, 30000);
                         if(settings_idx==3) MOTION_TIMEOUT_MS = clamp_i(MOTION_TIMEOUT_MS+100, 100, 5000);
-                        if(settings_idx==4) MOTION_STARTUP_MAX_MS = clamp_i(MOTION_STARTUP_MAX_MS+500, 0, 30000);
+                        if(settings_idx==4) MOTION_STARTUP_MS = clamp_i(MOTION_STARTUP_MS+500, 0, 30000);
                         if(settings_idx==5) MOTION_FAULT_ENABLED = !MOTION_FAULT_ENABLED;
+                        if(settings_idx==6) RUNOUT_COOLDOWN_MS = clamp_i(RUNOUT_COOLDOWN_MS+1000, 1000, 60000);
                     }
                     if(ev==EVT_CCW){
                         if(settings_idx==0) FEED_SPS = clamp_i(FEED_SPS-200, 200, 30000);
                         if(settings_idx==1) REV_SPS  = clamp_i(REV_SPS-200, 200, 30000);
                         if(settings_idx==2) AUTO_SPS = clamp_i(AUTO_SPS-200, 200, 30000);
                         if(settings_idx==3) MOTION_TIMEOUT_MS = clamp_i(MOTION_TIMEOUT_MS-100, 100, 5000);
-                        if(settings_idx==4) MOTION_STARTUP_MAX_MS = clamp_i(MOTION_STARTUP_MAX_MS-500, 0, 30000);
+                        if(settings_idx==4) MOTION_STARTUP_MS = clamp_i(MOTION_STARTUP_MS-500, 0, 30000);
                         if(settings_idx==5) MOTION_FAULT_ENABLED = !MOTION_FAULT_ENABLED;
+                        if(settings_idx==6) RUNOUT_COOLDOWN_MS = clamp_i(RUNOUT_COOLDOWN_MS-1000, 1000, 60000);
                     }
                     if(ev==EVT_CONFIRM || ev==EVT_BACK_DOWN) screen=SCR_SETTINGS;
                 }
@@ -560,28 +672,134 @@ int main(void){
                         } else if(manual_idx==1){
                             manual_action = (manual_action==MAN_FEED)?MAN_REV:MAN_FEED;
                         } else if(manual_idx==2){
-                            A = (manual_lane==1)? &M1 : &M2;
+                            lane_t *LM = lane_ptr(manual_lane, &L1, &L2);
                             if(!manual_running){
+                                stop_all(&L1,&L2);
+
                                 manual_running=true;
                                 manual_sps = (manual_action==MAN_FEED)? FEED_SPS : REV_SPS;
-                                motor_enable(A, true);
-                                motor_set_dir(A, manual_action==MAN_FEED);
-                                motor_set_rate_sps(A, manual_sps);
+
+                                lane_start(LM, TASK_MANUAL, manual_sps, (manual_action==MAN_FEED), now_ms, 0);
+
                                 motion_reset();
                                 motion_started_ms = now_ms;
-                                manual_started_ms = now_ms;
                             } else {
                                 manual_running=false;
-                                motor_stop(A);
+                                lane_stop(LM);
                             }
                         }
                     }
                 }
             }
+
+            // ===================== AUTO core =====================
+            if(!manual_running){
+
+                // autoload if IN sees filament but OUT not yet
+                if(lane_in_present(&L1) && !lane_out_present(&L1) && L1.task==TASK_IDLE){
+                    lane_start(&L1, TASK_AUTOLOAD, AUTO_SPS, true, now_ms, 6000);
+                }
+                if(lane_in_present(&L2) && !lane_out_present(&L2) && L2.task==TASK_IDLE){
+                    lane_start(&L2, TASK_AUTOLOAD, AUTO_SPS, true, now_ms, 6000);
+                }
+
+                // buffer latch logic
+                if(buffer_low){
+                    if(low_since_ms==0) low_since_ms = now_ms;
+                } else {
+                    low_since_ms = 0;
+                }
+
+                if(!feeding_latched){
+                    if(low_since_ms!=0 && (int)(now_ms - low_since_ms) >= LOW_DELAY_MS){
+                        feeding_latched = true;
+                        swap_armed = false;
+                    }
+                }
+
+                if(buffer_high){
+                    feeding_latched = false;
+                }
+
+                lane_t *A = lane_ptr(active_lane, &L1, &L2);
+                lane_t *B = lane_ptr(other_lane(active_lane), &L1, &L2);
+
+                bool a_in = lane_in_present(A);
+                bool b_in = lane_in_present(B);
+
+                // arm swap when active lane becomes empty
+                if(feeding_latched && !a_in){
+                    swap_armed = true;
+                }
+
+                // swap ONLY when Y empty
+                bool cooldown_ok = (int)(now_ms - swap_block_until_ms) >= 0;
+                bool y_ok = (!REQUIRE_Y_EMPTY_SWAP) || y_empty;
+
+                if(swap_armed && cooldown_ok && y_ok && b_in){
+                    if(A->task == TASK_FEED) lane_stop(A);
+                    if(B->task == TASK_FEED) lane_stop(B);
+
+                    active_lane = other_lane(active_lane);
+                    swap_armed = false;
+                    swap_block_until_ms = now_ms + (uint32_t)SWAP_COOLDOWN_MS;
+
+                    motion_reset();
+                    motion_started_ms = now_ms;
+                }
+
+                // KEEP FEEDING even if active lane IN went false, until Y becomes empty and swap happens
+                A = lane_ptr(active_lane, &L1, &L2);
+
+                if(feeding_latched){
+                    if(A->task != TASK_FEED){
+                        lane_start(A, TASK_FEED, 1, true, now_ms, 0);
+                        motion_reset();
+                        motion_started_ms = now_ms;
+                        ramp_current = 0;
+                        ramp_target = FEED_SPS;
+                    } else {
+                        ramp_target = FEED_SPS;
+                    }
+
+                    lane_t *O = lane_ptr(other_lane(active_lane), &L1, &L2);
+                    if(O->task == TASK_FEED) lane_stop(O);
+                } else {
+                    if(L1.task == TASK_FEED) lane_stop(&L1);
+                    if(L2.task == TASK_FEED) lane_stop(&L2);
+                    ramp_target = 0;
+                }
+
+                lane_tick(&L1, now_ms);
+                lane_tick(&L2, now_ms);
+            }
         }
 
-        // Motion logic for error (alleen als enabled + manual running)
-        bool moving_now = manual_running;
+        // ===================== Ramping =====================
+        if((int)(now_ms - ramp_last_ms) >= RAMP_TICK_MS){
+            ramp_last_ms = now_ms;
+
+            if(ramp_current < ramp_target) ramp_current += RAMP_STEP_SPS;
+            if(ramp_current > ramp_target) ramp_current = ramp_target;
+            if(ramp_target == 0 && ramp_current > 0){
+                ramp_current -= (RAMP_STEP_SPS*2);
+                if(ramp_current < 0) ramp_current = 0;
+            }
+
+            lane_t *A = lane_ptr(active_lane, &L1, &L2);
+            if(A->task == TASK_FEED){
+                motor_set_rate_sps(&A->m, ramp_current);
+                motor_enable(&A->m, ramp_current > 0);
+                motor_set_dir(&A->m, true);
+            }
+        }
+
+        // ===================== Motion + runout =====================
+        bool moving_now = false;
+        if(manual_running) moving_now = true;
+        if(L1.task==TASK_AUTOLOAD || L1.task==TASK_FEED) moving_now = true;
+        if(L2.task==TASK_AUTOLOAD || L2.task==TASK_FEED) moving_now = true;
+
         if(moving_now && !motion_was_moving){
             motion_reset();
             motion_started_ms = now_ms;
@@ -591,8 +809,9 @@ int main(void){
         bool motion_ok = true;
         if(moving_now){
             uint32_t run_ms = now_ms - motion_started_ms;
-            if((int)run_ms <= MOTION_STARTUP_MAX_MS){
-                motion_ok = true; // cooldown
+
+            if((int)run_ms <= MOTION_STARTUP_MS){
+                motion_ok = true;
             } else {
                 uint32_t lm = g_last_motion_ms;
                 if(lm == 0) motion_ok = false;
@@ -603,23 +822,73 @@ int main(void){
             }
         }
 
-        if(!error_active && moving_now && MOTION_FAULT_ENABLED && !motion_ok){
-            error_active=true;
-            error_msg="No motion detected";
-            runout_set(true);
-            manual_running=false;
-            motor_stop(&M1); motor_stop(&M2);
-            screen=SCR_ERROR;
+        bool filament_present = l1_in || l2_in;
+
+        if(!error_active && !manual_running && !filament_present){
+            if(now_ms > g_runout_block_until){
+                error_active=true;
+                error_msg="No filament L1/L2";
+                runout_set(true);
+                g_runout_block_until = now_ms + (uint32_t)RUNOUT_COOLDOWN_MS;
+                stop_all(&L1,&L2);
+                screen=SCR_ERROR;
+            }
         }
 
-        // UI refresh
+        if(!error_active && moving_now && MOTION_FAULT_ENABLED && !motion_ok){
+            if(now_ms > g_runout_block_until){
+                error_active=true;
+                error_msg="Filament not moving";
+                runout_set(true);
+                g_runout_block_until = now_ms + (uint32_t)RUNOUT_COOLDOWN_MS;
+                stop_all(&L1,&L2);
+                screen=SCR_ERROR;
+            }
+        }
+
+        // ===================== UI =====================
         if(absolute_time_diff_us(last_ui, now) > 80000){
             last_ui = now;
-            if(error_active) draw_error();
-            else if(screen==SCR_HOME) draw_home(motion_ok);
-            else if(screen==SCR_MENU) draw_list("Menu", 3, main_idx, main_label, NULL);
+
+            if(error_active){
+                draw_error();
+            } else if(screen==SCR_HOME){
+                u8g2_ClearBuffer(&g_u8g2);
+                u8g2_SetFont(&g_u8g2, u8g2_font_6x10_tf);
+
+                u8g2_DrawStr(&g_u8g2, 0, 10, "NightOwl");
+                u8g2_DrawHLine(&g_u8g2, 0, 12, 128);
+
+                char s[64];
+                snprintf(s, sizeof(s), "A:L%d  L1:%c/%c L2:%c/%c",
+                         active_lane,
+                         lane_in_present(&L1)?'Y':'-', lane_out_present(&L1)?'Y':'-',
+                         lane_in_present(&L2)?'Y':'-', lane_out_present(&L2)?'Y':'-');
+                u8g2_DrawStr(&g_u8g2, 0, 24, s);
+
+                snprintf(s, sizeof(s), "Buf L:%c H:%c  Y:%c",
+                         buffer_low?'Y':'-', buffer_high?'Y':'-',
+                         y_present?'Y':'-');
+                u8g2_DrawStr(&g_u8g2, 0, 36, s);
+
+                const char *st = manual_running ? "MAN" : feeding_latched ? "AUTO" : "IDLE";
+                snprintf(s, sizeof(s), "State:%s  Feed:%d", st, FEED_SPS);
+                u8g2_DrawStr(&g_u8g2, 0, 48, s);
+
+                bool raw = gpio_get(PIN_SFS_MOT);
+                snprintf(s, sizeof(s), "Mot:%s RAW:%d I:%lu P:%lu",
+                         motion_ok?"OK":"NO", raw?1:0,
+                         (unsigned long)g_motion_edges_irq,
+                         (unsigned long)g_motion_edges_poll);
+                u8g2_DrawStr(&g_u8g2, 0, 60, s);
+
+                u8g2_SendBuffer(&g_u8g2);
+            }
+            else if(screen==SCR_MENU){
+                draw_list("Menu", 3, main_idx, main_label, NULL);
+            }
             else if(screen==SCR_SETTINGS){
-                draw_list("Settings", 6, settings_idx, settings_label, NULL);
+                draw_list("Settings", 7, settings_idx, settings_label, NULL);
             }
             else if(screen==SCR_SETTINGS_EDIT){
                 char v[24]={0};
@@ -627,11 +896,14 @@ int main(void){
                 if(settings_idx==1) snprintf(v,sizeof(v),"%d",REV_SPS);
                 if(settings_idx==2) snprintf(v,sizeof(v),"%d",AUTO_SPS);
                 if(settings_idx==3) snprintf(v,sizeof(v),"%d",MOTION_TIMEOUT_MS);
-                if(settings_idx==4) snprintf(v,sizeof(v),"%d",MOTION_STARTUP_MAX_MS);
+                if(settings_idx==4) snprintf(v,sizeof(v),"%d",MOTION_STARTUP_MS);
                 if(settings_idx==5) snprintf(v,sizeof(v),"%s",MOTION_FAULT_ENABLED?"ON":"OFF");
-                draw_list("Edit", 6, settings_idx, settings_label, v);
+                if(settings_idx==6) snprintf(v,sizeof(v),"%d",RUNOUT_COOLDOWN_MS);
+                draw_list("Edit", 7, settings_idx, settings_label, v);
             }
-            else if(screen==SCR_MANUAL) draw_manual();
+            else if(screen==SCR_MANUAL){
+                draw_manual();
+            }
         }
 
         tight_loop_contents();
