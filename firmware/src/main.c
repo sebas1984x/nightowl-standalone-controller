@@ -24,12 +24,12 @@
 #define PIN_BUF_HIGH  7
 
 // Stepper outputs
-#define PIN_M1_EN    8
-#define PIN_M1_DIR   9
-#define PIN_M1_STEP  10
-#define PIN_M2_EN    14
-#define PIN_M2_DIR   15
-#define PIN_M2_STEP  16
+#define PIN_M1_EN     8
+#define PIN_M1_DIR    9
+#define PIN_M1_STEP   10
+#define PIN_M2_EN     14
+#define PIN_M2_DIR    15
+#define PIN_M2_STEP   16
 
 #define M1_DIR_INVERT 0
 #define M2_DIR_INVERT 1
@@ -73,6 +73,11 @@ static bool REQUIRE_Y_EMPTY_SWAP = true;
 // Ramp
 static int  RAMP_STEP_SPS        = 200;
 static int  RAMP_TICK_MS         = 5;
+
+// OLED robustness
+static bool     oled_fault = false;
+static uint32_t oled_fault_count = 0;
+static uint32_t oled_retry_ms = 0;
 
 // Helpers
 static inline int clamp_i(int v, int lo, int hi){
@@ -248,6 +253,43 @@ static u8g2_t g_u8g2;
 static uint8_t g_i2c_buf[128];
 static uint8_t g_i2c_len = 0;
 
+static void oled_bus_recover(void) {
+    i2c_deinit(OLED_I2C_INST);
+
+    gpio_set_function(PIN_I2C_SDA, GPIO_FUNC_SIO);
+    gpio_set_function(PIN_I2C_SCL, GPIO_FUNC_SIO);
+
+    gpio_set_dir(PIN_I2C_SDA, GPIO_IN);
+    gpio_set_dir(PIN_I2C_SCL, GPIO_OUT);
+    gpio_put(PIN_I2C_SCL, 1);
+    sleep_us(5);
+
+    for(int i = 0; i < 9; i++) {
+        gpio_put(PIN_I2C_SCL, 0);
+        sleep_us(5);
+        gpio_put(PIN_I2C_SCL, 1);
+        sleep_us(5);
+    }
+
+    gpio_set_function(PIN_I2C_SDA, GPIO_FUNC_I2C);
+    gpio_set_function(PIN_I2C_SCL, GPIO_FUNC_I2C);
+    gpio_pull_up(PIN_I2C_SDA);
+    gpio_pull_up(PIN_I2C_SCL);
+
+    i2c_init(OLED_I2C_INST, I2C_BAUDRATE);
+}
+
+static bool oled_i2c_write(uint8_t addr7, const uint8_t *buf, size_t len) {
+    int rc = i2c_write_timeout_us(OLED_I2C_INST, addr7, buf, len, false, 3000);
+    if(rc < 0) {
+        oled_fault = true;
+        oled_fault_count++;
+        oled_bus_recover();
+        return false;
+    }
+    return true;
+}
+
 static uint8_t u8x8_byte_pico_i2c(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void *arg_ptr) {
     switch (msg) {
         case U8X8_MSG_BYTE_INIT:
@@ -262,7 +304,10 @@ static uint8_t u8x8_byte_pico_i2c(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, vo
             while(arg_int--) {
                 if(g_i2c_len >= sizeof(g_i2c_buf)) {
                     uint8_t addr7 = (u8x8_GetI2CAddress(u8x8) >> 1);
-                    i2c_write_blocking(OLED_I2C_INST, addr7, g_i2c_buf, g_i2c_len, false);
+                    if(!oled_i2c_write(addr7, g_i2c_buf, g_i2c_len)) {
+                        g_i2c_len = 0;
+                        return 0;
+                    }
                     g_i2c_len = 0;
                 }
                 g_i2c_buf[g_i2c_len++] = *data++;
@@ -273,7 +318,10 @@ static uint8_t u8x8_byte_pico_i2c(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, vo
         case U8X8_MSG_BYTE_END_TRANSFER: {
             uint8_t addr7 = (u8x8_GetI2CAddress(u8x8) >> 1);
             if(g_i2c_len) {
-                i2c_write_blocking(OLED_I2C_INST, addr7, g_i2c_buf, g_i2c_len, false);
+                if(!oled_i2c_write(addr7, g_i2c_buf, g_i2c_len)) {
+                    g_i2c_len = 0;
+                    return 0;
+                }
             }
             g_i2c_len = 0;
             return 1;
@@ -303,7 +351,10 @@ static uint8_t u8x8_gpio_delay_pico(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, 
     }
 }
 
-static void oled_init(void) {
+static bool oled_init(void) {
+    oled_fault = false;
+    g_i2c_len = 0;
+
     i2c_init(OLED_I2C_INST, I2C_BAUDRATE);
     gpio_set_function(PIN_I2C_SDA, GPIO_FUNC_I2C);
     gpio_set_function(PIN_I2C_SCL, GPIO_FUNC_I2C);
@@ -317,10 +368,17 @@ static void oled_init(void) {
         u8x8_gpio_delay_pico
     );
     u8x8_SetI2CAddress(&g_u8g2.u8x8, (OLED_I2C_ADDR << 1));
+
     u8g2_InitDisplay(&g_u8g2);
+    if(oled_fault) return false;
+
     u8g2_SetPowerSave(&g_u8g2, 0);
+    if(oled_fault) return false;
+
     u8g2_ClearBuffer(&g_u8g2);
     u8g2_SendBuffer(&g_u8g2);
+
+    return !oled_fault;
 }
 
 // ===================== Encoder + buttons =====================
@@ -631,13 +689,18 @@ static uint32_t ramp_last_ms = 0;
 // active lane
 static int active_lane = 1;
 
+// motion timing
+static uint32_t motion_started_ms = 0;
+
 static void stop_all(lane_t *L1, lane_t *L2){
     lane_stop(L1);
     lane_stop(L2);
     feeding_latched = false;
     swap_armed = false;
+    low_since_ms = 0;
     ramp_target = 0;
     ramp_current = 0;
+    motion_started_ms = 0;
 }
 
 // ===================== MAIN =====================
@@ -669,13 +732,18 @@ int main(void){
     absolute_time_t last_ui = get_absolute_time();
     absolute_time_t last_poll = get_absolute_time();
 
-    uint32_t feed_started_ms = 0;
     bool motion_was_moving = false;
 
     while(true){
         absolute_time_t now = get_absolute_time();
         uint32_t now_ms = to_ms_since_boot(now);
         g_now_ms = now_ms;
+
+        // retry OLED occasionally if faulted
+        if(oled_fault && (int32_t)(now_ms - oled_retry_ms) >= 0){
+            oled_retry_ms = now_ms + 2000;
+            oled_init();
+        }
 
         // update all debounced inputs
         din_update(&y_split);
@@ -745,7 +813,6 @@ int main(void){
                 if(screen == SCR_HOME){
                     if(ev == EVT_CONFIRM) screen = SCR_MENU;
 
-                    // live feedrate on home
                     if(ev == EVT_CW)  FEED_SPS = clamp_i(FEED_SPS + 200, 200, 30000);
                     if(ev == EVT_CCW) FEED_SPS = clamp_i(FEED_SPS - 200, 200, 30000);
                 }
@@ -806,6 +873,7 @@ int main(void){
 
                                 lane_start(LM, TASK_MANUAL, manual_sps, (manual_action == MAN_FEED), now_ms, 0);
 
+                                motion_started_ms = now_ms;
                                 motion_reset();
                             } else {
                                 manual_running = false;
@@ -822,9 +890,13 @@ int main(void){
                 // simple autoload if IN sees filament and OUT not yet
                 if(lane_in_present(&L1) && !lane_out_present(&L1) && L1.task == TASK_IDLE){
                     lane_start(&L1, TASK_AUTOLOAD, AUTO_SPS, true, now_ms, 6000);
+                    motion_started_ms = now_ms;
+                    motion_reset();
                 }
                 if(lane_in_present(&L2) && !lane_out_present(&L2) && L2.task == TASK_IDLE){
                     lane_start(&L2, TASK_AUTOLOAD, AUTO_SPS, true, now_ms, 6000);
+                    motion_started_ms = now_ms;
+                    motion_reset();
                 }
 
                 // buffer latch logic
@@ -834,17 +906,20 @@ int main(void){
                     low_since_ms = 0;
                 }
 
-                if(!feeding_latched){
-                    if(low_since_ms != 0 && (int)(now_ms - low_since_ms) >= LOW_DELAY_MS){
-                        feeding_latched = true;
-                        swap_armed = false;
-                        feed_started_ms = now_ms;
-                        motion_reset();
-                    }
-                }
-
                 if(buffer_high){
                     feeding_latched = false;
+                    low_since_ms = 0;
+                }
+
+                if(!feeding_latched){
+                    if(!buffer_high &&
+                       low_since_ms != 0 &&
+                       (int32_t)(now_ms - low_since_ms) >= LOW_DELAY_MS){
+                        feeding_latched = true;
+                        swap_armed = false;
+                        motion_started_ms = now_ms;
+                        motion_reset();
+                    }
                 }
 
                 lane_t *A = lane_ptr(active_lane, &L1, &L2);
@@ -859,7 +934,7 @@ int main(void){
                 }
 
                 // execute swap only when Y empty
-                bool cooldown_ok = (int)(now_ms - swap_block_until_ms) >= 0;
+                bool cooldown_ok = (int32_t)(now_ms - swap_block_until_ms) >= 0;
                 bool y_ok = (!REQUIRE_Y_EMPTY_SWAP) || y_empty;
 
                 if(swap_armed && cooldown_ok && y_ok && b_in){
@@ -870,11 +945,10 @@ int main(void){
                     swap_armed = false;
                     swap_block_until_ms = now_ms + (uint32_t)SWAP_COOLDOWN_MS;
 
-                    feed_started_ms = now_ms;
+                    motion_started_ms = now_ms;
                     motion_reset();
                 }
 
-                // IMPORTANT FIX:
                 // if feeding is latched, keep feeding active lane even if a_in already went false.
                 // only stop when buffer_high unlatches or swap happened.
                 A = lane_ptr(active_lane, &L1, &L2);
@@ -884,6 +958,8 @@ int main(void){
                         lane_start(A, TASK_FEED, 1, true, now_ms, 0);
                         ramp_current = 0;
                         ramp_target = FEED_SPS;
+                        motion_started_ms = now_ms;
+                        motion_reset();
                     } else {
                         ramp_target = FEED_SPS;
                     }
@@ -902,7 +978,7 @@ int main(void){
         }
 
         // ===================== Ramp =====================
-        if((int)(now_ms - ramp_last_ms) >= RAMP_TICK_MS){
+        if((int32_t)(now_ms - ramp_last_ms) >= RAMP_TICK_MS){
             ramp_last_ms = now_ms;
 
             if(ramp_current < ramp_target) ramp_current += RAMP_STEP_SPS;
@@ -931,14 +1007,15 @@ int main(void){
 
         if(moving_now && !motion_was_moving){
             motion_reset();
+            motion_started_ms = now_ms;
         }
         motion_was_moving = moving_now;
 
         bool motion_ok = true;
         if(moving_now){
-            uint32_t run_ms = now_ms - feed_started_ms;
+            uint32_t run_ms = now_ms - motion_started_ms;
 
-            if((int)run_ms <= MOTION_STARTUP_MS){
+            if((int32_t)run_ms <= MOTION_STARTUP_MS){
                 motion_ok = true;
             } else {
                 uint32_t lm = g_last_motion_ms;
@@ -946,7 +1023,7 @@ int main(void){
                     motion_ok = false;
                 } else {
                     uint32_t age = now_ms - lm;
-                    if((int)age > MOTION_TIMEOUT_MS) motion_ok = false;
+                    if((int32_t)age > MOTION_TIMEOUT_MS) motion_ok = false;
                 }
             }
         }
@@ -976,7 +1053,7 @@ int main(void){
         }
 
         // ===================== UI =====================
-        if(absolute_time_diff_us(last_ui, now) > 80000){
+        if(!oled_fault && absolute_time_diff_us(last_ui, now) > 80000){
             last_ui = now;
 
             if(error_active){
@@ -1002,7 +1079,8 @@ int main(void){
                 u8g2_DrawStr(&g_u8g2, 0, 36, s);
 
                 const char *st = manual_running ? "MAN" : feeding_latched ? "AUTO" : "IDLE";
-                snprintf(s, sizeof(s), "State:%s  Feed:%d", st, FEED_SPS);
+                snprintf(s, sizeof(s), "State:%s Feed:%d OF:%lu", st, FEED_SPS,
+                         (unsigned long)oled_fault_count);
                 u8g2_DrawStr(&g_u8g2, 0, 48, s);
 
                 bool raw = gpio_get(PIN_SFS_MOT);
@@ -1033,6 +1111,10 @@ int main(void){
             }
             else if(screen == SCR_MANUAL){
                 draw_manual();
+            }
+
+            if(oled_fault){
+                oled_retry_ms = now_ms + 2000;
             }
         }
 
